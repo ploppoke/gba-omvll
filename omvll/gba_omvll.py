@@ -7,6 +7,10 @@ until they are validated on Thumb-1 (see docs/bringup.md).
 import omvll
 from functools import lru_cache
 
+# preproc puts COMPOUND_STRING arrays in these mergeable ROM sections.
+omvll.config.local_byte_array_sections = [".rodata.compound_string."]
+
+
 # Functions that must stay untouched: startup/interrupt paths and anything
 # already written in inline asm.
 EXCLUDED = {

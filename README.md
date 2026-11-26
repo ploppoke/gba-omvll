@@ -32,7 +32,7 @@ Wonderful's GNU binutils for assembly and linking.
 | lld | ELF linker available to clang (binutils `ld` still used for the ROM) |
 | [picolibc](https://github.com/picolibc/picolibc) | freestanding C library built for Thumb-1 with `-mabi=apcs-gnu` |
 | compiler-rt builtins | ARMv4T compiler runtime; replaces libgcc |
-| [o-mvll](https://github.com/open-obfuscator/o-mvll) (ploppoke fork) | pass plugin, patched for LLVM main + GBA |
+| [ploppoke/o-mvll](https://github.com/ploppoke/o-mvll) | pass plugin, patched for LLVM main and GBA |
 | GNU binutils (`arm-none-eabi-as`/`ld`) | assembles hand-written ROM asm and links the ROM |
 
 ## Layout
@@ -50,9 +50,9 @@ patches/                     minimal diffs carried by the forks
 
 ## Build
 
-Use sibling checkouts of `llvm-project`, picolibc 1.8.12, the `gba-port`
-branch of [ploppoke/o-mvll](https://github.com/ploppoke/o-mvll), `gba-omvll`,
-and the `omvll` branch of [ploppoke/pokeemerald-fufufu](https://github.com/ploppoke/pokeemerald-fufufu).
+Use sibling checkouts of `llvm-project`, picolibc 1.8.12, `gba-omvll`, and
+the `main` branches of [ploppoke/o-mvll](https://github.com/ploppoke/o-mvll)
+and [ploppoke/pokeemerald-fufufu](https://github.com/ploppoke/pokeemerald-fufufu).
 Start LLVM from `04c4ab8d9a15c548bfd472abd3407bc0be1e137e` and apply the
 [APCS record-layout patch](patches/clang-apcs-struct-boundary.patch).
 The verified LLVM checkout was `37a0a216311`; see the
@@ -73,10 +73,25 @@ cd "$ROOT/fufufu"
 make USE_CLANG=1 rom -j8
 ```
 
-To obfuscate `random.c` and `util.c` only, preserve the plain outputs before
-running `make USE_CLANG=1 OBFUSCATE=1 OBFUSCATE_SRCS='src/random.c src/util.c' rom -j8`.
-The [bring-up log](docs/bringup.md) includes dependencies, known limitations,
-and the exact release artifact paths.
+Save the plain outputs before the obfuscated build:
+
+```sh
+make USE_CLANG=1 LTO=0 RELEASE=0 OBFUSCATE=1 \
+  OBFUSCATE_SRCS='src/random.c src/util.c src/battle_message.c src/map_name_popup.c' rom -j8
+```
+
+The policy selects local decoding for eligible C strings and marks the
+`.rodata.compound_string.*` sections produced by the game's `COMPOUND_STRING`
+preprocessor. The plugin must support `local_byte_array_sections`. Only
+TU-local constant arrays passed directly to a single call are eligible; the
+decoder restores the original charmap bytes, including `FF`, without startup
+constructors. Tables of shared strings, unmarked arrays, and unselected files
+stay readable.
+
+See [the ROM's build and verification guide](https://github.com/ploppoke/pokeemerald-fufufu/blob/main/OBFUSCATION.md)
+for measured examples using [gba-tools](https://github.com/ploppoke/gba-tools).
+For source edits and a plain Clang rebuild instead, see
+[PKA](https://github.com/ploppoke/PatchouliKnowledgeAdvance).
 
 ## Use
 
@@ -93,12 +108,15 @@ arm-none-eabi-as -mcpu=arm7tdmi -march=armv4t -meabi=5 -o foo.o foo.s
 
 ## Status
 
-The final plain and selected O-MVLL builds link without undefined symbols.
-The link uses **26,910,488** ROM bytes plain and **26,916,000** obfuscated;
-both padded images are 33,554,432 bytes. The plain ROM reaches the Pokémon
-logo at frame 3600 in headless mGBA 0.10.5 with no fatal error. The PNG is
-`build/emerald/pokeemerald.clang-apcs.boot.f3600.png` in the ROM checkout.
-This is a boot smoke test, not gameplay or save validation.
+Both plain and obfuscated builds in the four-file example reached the title
+screen in headless mGBA. They are each 33,554,432 bytes padded; the linker's
+used ROM was 26,910,664 bytes plain and 26,928,676 bytes obfuscated. Neither
+linked ELF had undefined symbols or an `.init_array` section. See the
+[ROM guide](https://github.com/ploppoke/pokeemerald-fufufu/blob/main/OBFUSCATION.md)
+for the byte-level checks and the tested call sites.
+
+The [bring-up log](docs/bringup.md) records the initial two-file build and
+its boot artifacts. These are smoke tests, not gameplay or save validation.
 
 The port uses Thumb-1 UAL assembly, GCC-compatible APCS record layout,
 bounded Thumb flash helpers, and direct calls to the ARM decompressors
