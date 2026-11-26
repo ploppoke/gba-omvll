@@ -339,8 +339,8 @@ frames, 200 iterations:
 
 String getters decode their configured field size on every call, so
 descriptions cost several percent of a 280,896-cycle frame per lookup. The
-ROM grew 71,848 bytes and EWRAM 4,125 bytes (ten ring buffers, 4,056 bytes
-of data); IWRAM did not move. Both images returned identical bytes for every
+ROM grew 71,848 bytes and EWRAM 4,125 bytes (ten ring buffers and indices,
+4,096 bytes); IWRAM did not move. Both images returned identical bytes for every
 getter, including `Poké Ball`'s `1B` and the `FF` terminator. Details and the
 static 0-match evidence are in the ROM's
 [OBFUSCATION.md](https://github.com/ploppoke/pokeemerald-fufufu/blob/main/OBFUSCATION.md#encrypting-the-data-tables).
