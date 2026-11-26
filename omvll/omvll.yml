@@ -1,0 +1,4 @@
+# O-MVLL plugin configuration for the GBA port.
+# Paths are resolved relative to this file.
+OMVLL_PYTHONPATH: .
+OMVLL_CONFIG: gba_omvll.py
