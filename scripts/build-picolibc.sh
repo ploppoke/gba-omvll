@@ -26,10 +26,12 @@ SETUP_ARGS=(
   -Dthread-local-storage=false
   -Dio-long-long=false
   -Dformat-default=integer
+  -Datomic-ungetc=false
+  -Dfast-strcmp=false
 )
 
-if [ -d "$BUILD" ]; then
-  meson setup --reconfigure "$BUILD" "$SRC" --cross-file "$CROSS" "${SETUP_ARGS[@]}"
+if [ -f "$BUILD/meson-private/coredata.dat" ]; then
+  meson setup --wipe "$BUILD" "$SRC" --cross-file "$CROSS" "${SETUP_ARGS[@]}"
 else
   meson setup "$BUILD" "$SRC" --cross-file "$CROSS" "${SETUP_ARGS[@]}"
 fi
