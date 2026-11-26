@@ -42,6 +42,7 @@ scripts/build-llvm.sh        LLVM main -> $PREFIX
 scripts/build-picolibc.sh    picolibc -> $PREFIX/picolibc
 scripts/build-builtins.sh    compiler-rt -> $PREFIX/builtins
 scripts/build-omvll.sh       o-mvll plugin -> $OMVLL_BUILD/libOMVLL.dylib
+scripts/table-cost-probe.c   per-call cycle cost of linked getters (libmGBA)
 picolibc/armv4t-cross.ini    meson cross file (arm7tdmi, Thumb-1, apcs-gnu)
 omvll/omvll.yml              plugin discovery file
 omvll/gba_omvll.py           per-function/per-module obfuscation policy
@@ -87,6 +88,31 @@ TU-local constant arrays passed directly to a single call are eligible; the
 decoder restores the original charmap bytes, including `FF`, without startup
 constructors. Tables of shared strings, unmarked arrays, and unselected files
 stay readable.
+
+`omvll.config.encrypt_tables` additionally encrypts fields of the game's four
+big data tables at compile time and decrypts them in the getters that read
+them. Fields are declared by name, element stride, and per-field
+offset/size/key:
+
+| kind | example fields | compiled as |
+| --- | --- | --- |
+| `scalar` | `baseHP`, `price`, `height` | per-load XOR with an inline mask |
+| `inline_string` | `speciesName`, `categoryName` | 13–17 B copy into a RAM ring buffer |
+| `pointer_string` | `name`, `description` | 32–256 B copy into a RAM ring buffer |
+
+`ring_section` and `local_decode_section` keep the buffers in `.sbss` so
+IWRAM is untouched. Decryption is attached to loads in the table's own
+translation unit, so every reader must live there: `src/pokemon.c`,
+`src/move.c`, and `src/item.c` in this fork expose getters such as
+`GetMoveName()` and `GetSpeciesBaseHP()`, and no other file may read an
+encrypted field directly.
+
+Measured on the reference ROM: +71,848 ROM bytes, +4,125 EWRAM, +0 IWRAM.
+Name getters cost about 2,300–2,900 cycles per call and description getters
+8,500–27,600 (1 frame is 280,896 cycles), because a decoded string copies its
+whole configured field size. See the
+[cost measurements](docs/bringup.md#struct-table-encryption-cost) and the
+[ROM proof](https://github.com/ploppoke/pokeemerald-fufufu/blob/main/OBFUSCATION.md#encrypting-the-data-tables).
 
 See [the ROM's build and verification guide](https://github.com/ploppoke/pokeemerald-fufufu/blob/main/OBFUSCATION.md)
 for measured examples using [gba-tools](https://github.com/ploppoke/gba-tools).

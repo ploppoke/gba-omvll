@@ -9,7 +9,8 @@ from functools import lru_cache
 
 # preproc puts COMPOUND_STRING arrays in these mergeable ROM sections.
 omvll.config.local_byte_array_sections = [".rodata.compound_string."]
-
+# Place local string decode buffers in EWRAM (.sbss) so IWRAM stack headroom is untouched.
+omvll.config.local_decode_section = ".sbss"
 # Compile-time in-place encryption for the four major Pokémon data tables.
 # Offsets and element strides match ARMv4T APCS-GNU layout in pokeemerald-fufufu.
 omvll.config.encrypt_tables = [
@@ -122,9 +123,8 @@ EXCLUDED = {
 class GBAConfig(omvll.ObfuscationConfig):
     def obfuscate_string(self, mod: omvll.Module, func: omvll.Function,
                          string: bytes):
-        if func.name in EXCLUDED:
+        if func.name in EXCLUDED or mod.name.endswith(TABLE_MODULES):
             return None
-        # No global mode: pokeemerald's crt0 never runs .init_array, so the
         # module constructor that would decode globals at startup does not
         # exist on this target. Local mode decodes at each use site.
         return omvll.StringEncOptLocal()

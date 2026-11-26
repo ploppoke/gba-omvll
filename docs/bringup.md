@@ -303,3 +303,44 @@ remain in this run. Logs: `/tmp/gba-clang-uatcheck-anim-align.log`
 (final), `/tmp/gba-clang-uatcheck-rng-nickname.log` and
 `/tmp/gba-clang-uatcheck-rngfix.log` (earlier clang runs), and
 `/tmp/gba-gccref-check-isolated.log` (GCC reference).
+
+### Struct-table encryption cost
+
+`scripts/table-cost-probe.c` measures a linked function's cost on a booted
+image. It takes the ROM, a boot length, an iteration count, and
+`kind:label:addr:r0` triples read from `arm-none-eabi-nm`; `s` dumps the
+returned game text to its `0xFF` terminator, `n` prints a scalar result.
+
+```sh
+cc -O2 -o /tmp/table-cost-probe scripts/table-cost-probe.c \
+  -I/opt/homebrew/include -L/opt/homebrew/lib -lmgba
+NM=/opt/wonderful/toolchain/gcc-arm-none-eabi/bin/arm-none-eabi-nm
+addr=$($NM fufufu/pokeemerald.elf | awk '/ GetMoveName$/{print $1}')
+/tmp/table-cost-probe fufufu/pokeemerald.gba 600 100 "s:GetMoveName:$addr:55"
+```
+
+An early version timed with `mTimingGlobalTime` and reported 0 cycles for
+plain accessors. Two separate causes: `GBAStep` does not tick the timing
+subsystem per instruction, and `GBAProcessEvents` rebases `cpu->cycles`
+whenever it fires. Timing `ARMCore::cycles` with `cpu->nextEvent` pushed to
+`INT32_MAX` gives stable, per-iteration-identical deltas.
+
+Release pairs (`build/obfuscation-smoke/{plain,omvll}-release`), 600 boot
+frames, 200 iterations:
+
+| getter | plain | encrypted |
+| --- | ---: | ---: |
+| `GetSpeciesBaseHP` | 144 | 441 |
+| `GetSpeciesName` | 152 | 2,501 |
+| `GetMoveName` | 53 | 2,950 |
+| `GetItemDescription` | 57 | 8,536 |
+| `GetMoveDescription` | 55 | 11,991 |
+| `GetSpeciesPokedexDescription` | 158 | 27,622 |
+
+String getters decode their configured field size on every call, so
+descriptions cost several percent of a 280,896-cycle frame per lookup. The
+ROM grew 71,848 bytes and EWRAM 4,125 bytes (ten ring buffers, 4,056 bytes
+of data); IWRAM did not move. Both images returned identical bytes for every
+getter, including `Poké Ball`'s `1B` and the `FF` terminator. Details and the
+static 0-match evidence are in the ROM's
+[OBFUSCATION.md](https://github.com/ploppoke/pokeemerald-fufufu/blob/main/OBFUSCATION.md#encrypting-the-data-tables).
