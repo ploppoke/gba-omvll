@@ -19,7 +19,10 @@ class GBAConfig(omvll.ObfuscationConfig):
                          string: bytes):
         if func.name in EXCLUDED:
             return None
-        return omvll.StringEncOptGlobal()
+        # No global mode: pokeemerald's crt0 never runs .init_array, so the
+        # module constructor that would decode globals at startup does not
+        # exist on this target. Local mode decodes at each use site.
+        return omvll.StringEncOptLocal()
 
     def obfuscate_constants(self, mod: omvll.Module, func: omvll.Function):
         if func.name in EXCLUDED:

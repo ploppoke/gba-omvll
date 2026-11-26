@@ -1,0 +1,417 @@
+From 37a0a216311a25f7b5caffb800653a92663a778e Mon Sep 17 00:00:00 2001
+From: Heni <i@pingas.org>
+Date: Wed, 25 Nov 2026 23:54:00 -0600
+Subject: [PATCH] Clang: match GCC bare-metal ARM APCS record layout
+
+Apply the APCS record alignment floor before layout and use the GCC
+bit-field placement rules without changing Darwin APCS or default AAPCS.
+Allow explicit AArch32 ELF structure size boundaries in the driver and cc1,
+and serialize the override in PCH/modules.
+---
+ clang/docs/ReleaseNotes.md                    |  8 ++
+ clang/include/clang/Basic/TargetInfo.h        |  8 ++
+ clang/include/clang/Basic/TargetOptions.h     |  3 +
+ clang/include/clang/Options/Options.td        |  4 +
+ clang/lib/AST/RecordLayoutBuilder.cpp         | 30 ++++++-
+ clang/lib/Basic/Targets/ARM.cpp               | 35 +++++---
+ clang/lib/Basic/Targets/ARM.h                 |  5 ++
+ clang/lib/Driver/ToolChains/Clang.cpp         |  2 +
+ clang/lib/Frontend/CompilerInvocation.cpp     | 17 +++-
+ clang/lib/Serialization/ASTReader.cpp         |  2 +
+ clang/lib/Serialization/ASTWriter.cpp         |  1 +
+ .../CodeGen/arm-structure-size-boundary.c     | 85 +++++++++++++++++++
+ 12 files changed, 183 insertions(+), 17 deletions(-)
+ create mode 100644 clang/test/CodeGen/arm-structure-size-boundary.c
+
+diff --git a/clang/docs/ReleaseNotes.md b/clang/docs/ReleaseNotes.md
+index 4bebce452..b56c4c589 100644
+--- a/clang/docs/ReleaseNotes.md
++++ b/clang/docs/ReleaseNotes.md
+@@ -84,6 +84,14 @@ in a future version of Clang.
+ 
+ ### ABI Changes in This Version
+ 
++- Bare-metal AArch32 with `-mabi=apcs-gnu` now follows GCC's record layout:
++  unpacked records have a minimum alignment of 32 bits, and bit-field
++  containers follow their declared type's alignment without raising the
++  record alignment for unnamed fields. AArch32 ELF targets also accept
++  `-mstructure-size-boundary=8|32|64` to change the record alignment floor;
++  as in GCC, 64 is only effective for AAPCS-based ABIs. The default AAPCS
++  layout is unchanged.
++
+ - Clang now correctly mangles ``new std::initializer_list<T>{...}``
+   expressions under the Itanium C++ ABI. Previous versions emitted a duplicate
+   initializer-list marker in the mangled name. (#GH232531)
+diff --git a/clang/include/clang/Basic/TargetInfo.h b/clang/include/clang/Basic/TargetInfo.h
+index 7c5c35a5c..665af97a8 100644
+--- a/clang/include/clang/Basic/TargetInfo.h
++++ b/clang/include/clang/Basic/TargetInfo.h
+@@ -941,6 +941,10 @@ public:
+     UseSignedCharForObjCBool = false;
+   }
+ 
++  /// Minimum alignment and size-rounding boundary for unpacked records, in
++  /// bits, or zero if the ABI imposes no additional alignment.
++  virtual unsigned getStructureSizeBoundary() const { return 0; }
++
+   /// Check whether the alignment of bit-field types is respected
+   /// when laying out structures.
+   bool useBitFieldTypeAlignment() const {
+@@ -979,6 +983,10 @@ public:
+     return UseExplicitBitFieldAlignment;
+   }
+ 
++  /// Apply explicit field alignment before testing whether the bit-field fits
++  /// in the container required by its declared type.
++  virtual bool useExplicitBitFieldAlignmentFirst() const { return false; }
++
+   /// Check whether this target support '\#pragma options align=mac68k'.
+   bool hasAlignMac68kSupport() const {
+     return HasAlignMac68kSupport;
+diff --git a/clang/include/clang/Basic/TargetOptions.h b/clang/include/clang/Basic/TargetOptions.h
+index 8dfc8b879..5ff807cf6 100644
+--- a/clang/include/clang/Basic/TargetOptions.h
++++ b/clang/include/clang/Basic/TargetOptions.h
+@@ -44,6 +44,9 @@ public:
+   /// If given, the name of the target ABI to use.
+   std::string ABI;
+ 
++  /// Explicit AArch32 record size boundary in bits, or zero for the ABI default.
++  unsigned StructureSizeBoundary = 0;
++
+   /// The EABI version to use
+   llvm::EABI EABIVersion = llvm::EABI::Default;
+ 
+diff --git a/clang/include/clang/Options/Options.td b/clang/include/clang/Options/Options.td
+index db5ec793b..842218bad 100644
+--- a/clang/include/clang/Options/Options.td
++++ b/clang/include/clang/Options/Options.td
+@@ -5633,6 +5633,10 @@ def malign_jumps_EQ : Joined<["-"], "malign-jumps=">, Group<clang_ignored_m_Grou
+ let Flags = [TargetSpecific] in {
+ def mabi_EQ : Joined<["-"], "mabi=">, Group<m_Group>,
+   Visibility<[ClangOption, CC1Option, FlangOption, FC1Option]>;
++def mstructure_size_boundary_EQ : Joined<["-"], "mstructure-size-boundary=">,
++  Group<m_Group>, Visibility<[ClangOption, CC1Option]>,
++  HelpText<"Set the minimum alignment of unpacked records in bits (AArch32 ELF only)">,
++  MarshallingInfoInt<TargetOpts<"StructureSizeBoundary">, "0">;
+ def malign_branch_EQ : CommaJoined<["-"], "malign-branch=">, Group<m_Group>,
+   HelpText<"Specify types of branches to align">;
+ def malign_branch_boundary_EQ : Joined<["-"], "malign-branch-boundary=">, Group<m_Group>,
+diff --git a/clang/lib/AST/RecordLayoutBuilder.cpp b/clang/lib/AST/RecordLayoutBuilder.cpp
+index 40b747da5..bac9f8d6f 100644
+--- a/clang/lib/AST/RecordLayoutBuilder.cpp
++++ b/clang/lib/AST/RecordLayoutBuilder.cpp
+@@ -1339,6 +1339,17 @@ void ItaniumRecordLayoutBuilder::InitializeLayout(const Decl *D) {
+ 
+     if (unsigned MaxAlign = D->getMaxAlignment())
+       UpdateAlignment(Context.toCharUnitsFromBits(MaxAlign));
++
++    // The ABI's structure-size boundary is a minimum record alignment, not a
++    // field-alignment requirement. Packing caps it or, for packed records,
++    // suppresses it altogether.
++    if (isa<RecordDecl>(D)) {
++      CharUnits Boundary = Context.toCharUnitsFromBits(
++          Context.getTargetInfo().getStructureSizeBoundary());
++      if (!MaxFieldAlignment.isZero())
++        Boundary = std::min(Boundary, MaxFieldAlignment);
++      UpdateAlignment(Packed ? CharUnits::One() : Boundary, Boundary);
++    }
+   }
+ 
+   HandledFirstNonOverlappingEmptyField =
+@@ -1554,7 +1565,7 @@ void ItaniumRecordLayoutBuilder::LayoutBitField(const FieldDecl *D) {
+   // where the entire bitfield would fit in an aligned storage unit of
+   // the declared type; it's okay if an earlier or later non-bitfield
+   // is allocated in the same storage unit.  However, some targets
+-  // (those that !useBitFieldTypeAlignment(), e.g. ARM APCS) don't
++  // (those that !useBitFieldTypeAlignment(), e.g. Darwin ARM APCS) don't
+   // require this storage unit to be aligned, and therefore always put
+   // the bitfield at the next available bit offset.
+ 
+@@ -1724,6 +1735,23 @@ void ItaniumRecordLayoutBuilder::LayoutBitField(const FieldDecl *D) {
+       UnfilledBitsInLastUnit = 0;
+     }
+ 
++  } else if (FieldSize && ExplicitFieldAlign &&
++             Context.getTargetInfo().useExplicitBitFieldAlignmentFirst()) {
++    // GCC APCS first advances to the explicit alignment (capped by
++    // #pragma pack), then tests the fit using the natural container.
++    unsigned ExplicitAlign =
++        MaxFieldAlignmentInBits
++            ? std::min(ExplicitFieldAlign, MaxFieldAlignmentInBits)
++            : ExplicitFieldAlign;
++    auto PlaceBitField = [&](uint64_t Offset, bool Packed) {
++      Offset = llvm::alignTo(Offset, ExplicitAlign);
++      if (!Packed && MaxFieldAlignment.isZero() &&
++          (Offset & (FieldInfo.Align - 1)) + FieldSize > StorageUnitSize)
++        Offset = llvm::alignTo(Offset, FieldInfo.Align);
++      return Offset;
++    };
++    FieldOffset = PlaceBitField(FieldOffset, FieldPacked);
++    UnpackedFieldOffset = PlaceBitField(UnpackedFieldOffset, false);
+   } else {
+     // #pragma pack, with any value, suppresses the insertion of padding.
+     bool AllowPadding = MaxFieldAlignment.isZero();
+diff --git a/clang/lib/Basic/Targets/ARM.cpp b/clang/lib/Basic/Targets/ARM.cpp
+index 807eb8def..82c14c2b9 100644
+--- a/clang/lib/Basic/Targets/ARM.cpp
++++ b/clang/lib/Basic/Targets/ARM.cpp
+@@ -36,6 +36,7 @@ void ARMTargetInfo::setABIAAPCS() {
+     WCharType = UnsignedInt;
+ 
+   UseBitFieldTypeAlignment = true;
++  UseZeroLengthBitfieldAlignment = true;
+ 
+   ZeroLengthBitfieldBoundary = 0;
+ 
+@@ -56,20 +57,32 @@ void ARMTargetInfo::setABIAPCS(bool IsAAPCS16) {
+ 
+   WCharType = SignedInt;
+ 
+-  // Do not respect the alignment of bit-field types when laying out
+-  // structures. This corresponds to PCC_BITFIELD_TYPE_MATTERS in gcc.
+-  UseBitFieldTypeAlignment = false;
+-
+-  /// gcc forces the alignment to 4 bytes, regardless of the type of the
+-  /// zero length bitfield.  This corresponds to EMPTY_FIELD_BOUNDARY in
+-  /// gcc.
+-  ZeroLengthBitfieldBoundary = 32;
++  // Bare-metal GCC APCS places bit-fields in naturally aligned containers just
++  // like AAPCS, but unnamed bit-fields (including zero-width fields) do not
++  // contribute to the record's alignment. Keep the historical layout on other
++  // targets that use Clang's APCS calling convention, such as Darwin.
++  UseBitFieldTypeAlignment = usesGNUAPCSRecordLayout();
++  UseZeroLengthBitfieldAlignment = !UseBitFieldTypeAlignment;
++  ZeroLengthBitfieldBoundary = UseBitFieldTypeAlignment ? 0 : 32;
+ 
+   resetDataLayout();
+ 
+   // FIXME: Override "preferred align" for double and long long.
+ }
+ 
++bool ARMTargetInfo::usesGNUAPCSRecordLayout() const {
++  return ABI == "apcs-gnu" && getTriple().isOSUnknown() &&
++         getTriple().isOSBinFormatELF();
++}
++
++unsigned ARMTargetInfo::getStructureSizeBoundary() const {
++  unsigned Boundary = getTargetOpts().StructureSizeBoundary;
++  // GCC accepts 64 only for AAPCS-based ABIs. APCS falls back to its default.
++  if (Boundary && (Boundary != 64 || IsAAPCS))
++    return Boundary;
++  return usesGNUAPCSRecordLayout() ? 32 : 0;
++}
++
+ void ARMTargetInfo::setArchInfo() {
+   StringRef ArchName = getTriple().getArchName();
+ 
+@@ -319,12 +332,6 @@ ARMTargetInfo::ARMTargetInfo(const llvm::Triple &Triple,
+   if (IsAAPCS && !Triple.isAndroid())
+     DefaultAlignForAttributeAligned = MaxVectorAlign = 64;
+ 
+-  // Do force alignment of members that follow zero length bitfields.  If
+-  // the alignment of the zero-length bitfield is greater than the member
+-  // that follows it, `bar', `bar' will be aligned as the  type of the
+-  // zero length bitfield.
+-  UseZeroLengthBitfieldAlignment = true;
+-
+   if (Triple.getOS() == llvm::Triple::Linux ||
+       Triple.getOS() == llvm::Triple::UnknownOS)
+     this->MCountName =
+diff --git a/clang/lib/Basic/Targets/ARM.h b/clang/lib/Basic/Targets/ARM.h
+index a9ab0373a..cf86c6cf8 100644
+--- a/clang/lib/Basic/Targets/ARM.h
++++ b/clang/lib/Basic/Targets/ARM.h
+@@ -123,6 +123,7 @@ class LLVM_LIBRARY_VISIBILITY ARMTargetInfo : public TargetInfo {
+ 
+   void setABIAAPCS();
+   void setABIAPCS(bool IsAAPCS16);
++  bool usesGNUAPCSRecordLayout() const;
+ 
+   void setArchInfo();
+   void setArchInfo(llvm::ARM::ArchKind Kind);
+@@ -144,6 +145,10 @@ public:
+ 
+   StringRef getABI() const override;
+   bool setABI(const std::string &Name) override;
++  unsigned getStructureSizeBoundary() const override;
++  bool useExplicitBitFieldAlignmentFirst() const override {
++    return usesGNUAPCSRecordLayout();
++  }
+ 
+   bool isBranchProtectionSupportedArch(StringRef Arch) const override;
+   bool validateBranchProtection(const ParsedTargetAttr &Attr,
+diff --git a/clang/lib/Driver/ToolChains/Clang.cpp b/clang/lib/Driver/ToolChains/Clang.cpp
+index 41f2e85a2..f5992933d 100644
+--- a/clang/lib/Driver/ToolChains/Clang.cpp
++++ b/clang/lib/Driver/ToolChains/Clang.cpp
+@@ -1550,6 +1550,8 @@ static void CollectARMPACBTIOptions(const ToolChain &TC, const ArgList &Args,
+ void Clang::AddARMTargetArgs(const llvm::Triple &Triple, const ArgList &Args,
+                              ArgStringList &CmdArgs, bool KernelOrKext) const {
+   RenderARMABI(getToolChain().getDriver(), Triple, Args, CmdArgs);
++  if (Triple.isOSBinFormatELF())
++    Args.AddLastArg(CmdArgs, options::OPT_mstructure_size_boundary_EQ);
+ 
+   // Determine floating point ABI from the options & target defaults.
+   arm::FloatABI ABI = arm::getARMFloatABI(getToolChain(), Args);
+diff --git a/clang/lib/Frontend/CompilerInvocation.cpp b/clang/lib/Frontend/CompilerInvocation.cpp
+index 9af6f6c41..a0d3d2a60 100644
+--- a/clang/lib/Frontend/CompilerInvocation.cpp
++++ b/clang/lib/Frontend/CompilerInvocation.cpp
+@@ -5112,6 +5112,19 @@ static bool ParseTargetArgs(TargetOptions &Opts, ArgList &Args,
+ #include "clang/Options/Options.inc"
+ #undef TARGET_OPTION_WITH_MARSHALLING
+ 
++  if (const Arg *A = Args.getLastArg(OPT_mstructure_size_boundary_EQ)) {
++    llvm::Triple T(Opts.Triple);
++    if ((!T.isARM() && !T.isThumb()) || !T.isOSBinFormatELF())
++      Diags.Report(diag::err_drv_unsupported_opt_for_target)
++          << A->getAsString(Args) << T.str();
++    else if (Diags.getNumErrors() == NumErrorsBefore &&
++             Opts.StructureSizeBoundary != 8 &&
++             Opts.StructureSizeBoundary != 32 &&
++             Opts.StructureSizeBoundary != 64)
++      Diags.Report(diag::err_drv_invalid_value)
++          << A->getAsString(Args) << A->getValue();
++  }
++
+   if (Arg *A = Args.getLastArg(options::OPT_target_sdk_version_EQ)) {
+     llvm::VersionTuple Version;
+     if (Version.tryParse(A->getValue()))
+@@ -5350,8 +5363,8 @@ std::string CompilerInvocation::computeContextHash() const {
+   HBuilder.add(getLangOpts().CommentOpts.RetainCommentsFromSystemHeaders);
+ 
+   // Extend the signature with the target options.
+-  HBuilder.add(getTargetOpts().Triple, getTargetOpts().CPU,
+-               getTargetOpts().TuneCPU, getTargetOpts().ABI);
++  HBuilder.add(getTargetOpts().Triple, getTargetOpts().CPU, getTargetOpts().TuneCPU,
++               getTargetOpts().ABI, getTargetOpts().StructureSizeBoundary);
+   HBuilder.addRange(getTargetOpts().FeaturesAsWritten);
+ 
+   // Extend the signature with preprocessor options.
+diff --git a/clang/lib/Serialization/ASTReader.cpp b/clang/lib/Serialization/ASTReader.cpp
+index 105e1087f..f984898ab 100644
+--- a/clang/lib/Serialization/ASTReader.cpp
++++ b/clang/lib/Serialization/ASTReader.cpp
+@@ -507,6 +507,7 @@ static bool checkTargetOptions(const TargetOptions &TargetOpts,
+   // The triple and ABI must match exactly.
+   CHECK_TARGET_OPT(Triple, "target");
+   CHECK_TARGET_OPT(ABI, "target ABI");
++  CHECK_TARGET_OPT(StructureSizeBoundary, "structure size boundary");
+ 
+   // We can tolerate different CPUs in many cases, notably when one CPU
+   // supports a strict superset of another. When allowing compatible
+@@ -6851,6 +6852,7 @@ bool ASTReader::ParseTargetOptions(const RecordData &Record,
+   TargetOpts.CPU = ReadString(Record, Idx);
+   TargetOpts.TuneCPU = ReadString(Record, Idx);
+   TargetOpts.ABI = ReadString(Record, Idx);
++  TargetOpts.StructureSizeBoundary = Record[Idx++];
+   for (unsigned N = Record[Idx++]; N; --N) {
+     TargetOpts.FeaturesAsWritten.push_back(ReadString(Record, Idx));
+   }
+diff --git a/clang/lib/Serialization/ASTWriter.cpp b/clang/lib/Serialization/ASTWriter.cpp
+index 5dafb9aa6..d5a4425b6 100644
+--- a/clang/lib/Serialization/ASTWriter.cpp
++++ b/clang/lib/Serialization/ASTWriter.cpp
+@@ -1725,6 +1725,7 @@ void ASTWriter::WriteControlBlock(Preprocessor &PP, StringRef isysroot) {
+   AddString(TargetOpts.CPU, Record);
+   AddString(TargetOpts.TuneCPU, Record);
+   AddString(TargetOpts.ABI, Record);
++  Record.push_back(TargetOpts.StructureSizeBoundary);
+   Record.push_back(TargetOpts.FeaturesAsWritten.size());
+   for (unsigned I = 0, N = TargetOpts.FeaturesAsWritten.size(); I != N; ++I) {
+     AddString(TargetOpts.FeaturesAsWritten[I], Record);
+diff --git a/clang/test/CodeGen/arm-structure-size-boundary.c b/clang/test/CodeGen/arm-structure-size-boundary.c
+new file mode 100644
+index 000000000..15423ea50
+--- /dev/null
++++ b/clang/test/CodeGen/arm-structure-size-boundary.c
+@@ -0,0 +1,85 @@
++// REQUIRES: arm-registered-target
++// RUN: %clang_cc1 -triple thumbv4t-none-eabi -target-abi apcs-gnu -DAPCS -DBOUNDARY=4 -emit-llvm -o - %s | FileCheck %s --check-prefixes=COMMON,APCS
++// RUN: %clang_cc1 -triple thumbv4t-none-eabi -target-abi apcs-gnu -DAPCS -DBOUNDARY=1 -mstructure-size-boundary=8 -fsyntax-only %s
++// RUN: %clang_cc1 -triple thumbv4t-none-eabi -target-abi apcs-gnu -DAPCS -DBOUNDARY=4 -mstructure-size-boundary=64 -fsyntax-only %s
++// RUN: %clang_cc1 -triple thumbv4t-none-eabi -DBOUNDARY=1 -emit-llvm -o - %s | FileCheck %s --check-prefixes=COMMON,AAPCS
++// RUN: %clang_cc1 -triple thumbv4t-none-eabi -target-abi aapcs -DBOUNDARY=8 -mstructure-size-boundary=64 -fsyntax-only %s
++// RUN: %clang --target=thumbv4t-none-eabi -mabi=aapcs -DBOUNDARY=4 -mstructure-size-boundary=8 -mstructure-size-boundary=32 -fsyntax-only %s
++// RUN: not %clang_cc1 -triple thumbv4t-none-eabi -mstructure-size-boundary=16 -fsyntax-only %s 2>&1 | FileCheck %s --check-prefix=INVALID
++// INVALID: error: invalid value '16' in '-mstructure-size-boundary=16'
++
++#define CHECK_SIZE_ALIGN(type, size, alignment) \
++  _Static_assert(sizeof(type) == (size), #type " size"); \
++  _Static_assert(_Alignof(type) == (alignment), #type " alignment")
++#define MAX(a, b) ((a) > (b) ? (a) : (b))
++#define ROUND(size, align) (((size) + (align)-1) & -(align))
++
++// APCS-DAG: %struct.Small = type { i8, [3 x i8] }
++// AAPCS-DAG: %struct.Small = type { i8 }
++// COMMON-DAG: %struct.Packed = type <{ i8, i16 }>
++// COMMON-DAG: %struct.Aligned = type { i8, [7 x i8] }
++// APCS-DAG: @smalls = {{.*}}global [2 x %struct.Small] zeroinitializer, align 4
++// AAPCS-DAG: @smalls = {{.*}}global [2 x %struct.Small] zeroinitializer, align 1
++// COMMON-DAG: @packeds = {{.*}}global [2 x %struct.Packed] zeroinitializer, align 1
++// COMMON-DAG: @aligneds = {{.*}}global [2 x %struct.Aligned] zeroinitializer, align 8
++struct Small { char c; } smalls[2];
++struct Packed { char c; short s; } __attribute__((packed)) packeds[2];
++struct Aligned { char c; } __attribute__((aligned(8))) aligneds[2];
++struct PackedAligned { char c; short s; } __attribute__((packed, aligned(2)));
++union Byte { char c; };
++struct Nested { char c; struct Small inner[2]; };
++
++CHECK_SIZE_ALIGN(struct Small, BOUNDARY, BOUNDARY);
++CHECK_SIZE_ALIGN(struct Packed, 3, 1);
++CHECK_SIZE_ALIGN(struct Aligned, 8, 8);
++CHECK_SIZE_ALIGN(struct PackedAligned, 4, 2);
++CHECK_SIZE_ALIGN(union Byte, BOUNDARY, BOUNDARY);
++CHECK_SIZE_ALIGN(struct Nested, 3 * BOUNDARY, BOUNDARY);
++_Static_assert(__builtin_offsetof(struct Nested, inner) == BOUNDARY, "nested offset");
++_Static_assert(sizeof(smalls) == 2 * BOUNDARY, "array stride");
++
++#pragma pack(push, 2)
++struct Pragma { char c; };
++#pragma pack(pop)
++#define PRAGMA_ALIGN (BOUNDARY < 2 ? BOUNDARY : 2)
++CHECK_SIZE_ALIGN(struct Pragma, PRAGMA_ALIGN, PRAGMA_ALIGN);
++
++struct Bits8 { unsigned char a : 7, b : 6; char c; };
++struct Bits16 { unsigned char a : 7; unsigned short b : 11; char c; };
++struct Bits32 { unsigned short a : 15; unsigned b : 21; char c; };
++struct Zero8 { unsigned char a : 1; unsigned char : 0; char c; };
++struct Zero16 { unsigned char a : 1; unsigned short : 0; char c; };
++struct Anon32 { unsigned : 1; char c; };
++struct PackedZero { char a; unsigned : 0; char c; } __attribute__((packed));
++
++_Static_assert(__builtin_offsetof(struct Bits8, c) == 2, "char container");
++_Static_assert(__builtin_offsetof(struct Bits16, c) == 4, "short container");
++_Static_assert(__builtin_offsetof(struct Bits32, c) == 7, "int container");
++_Static_assert(__builtin_offsetof(struct Zero8, c) == 1, "char zero-width field");
++_Static_assert(__builtin_offsetof(struct Zero16, c) == 2, "short zero-width field");
++_Static_assert(__builtin_offsetof(struct PackedZero, c) == 4, "packed zero-width field");
++CHECK_SIZE_ALIGN(struct Bits16, ROUND(5, MAX(BOUNDARY, 2)), MAX(BOUNDARY, 2));
++#ifdef APCS
++CHECK_SIZE_ALIGN(struct Zero16, ROUND(3, BOUNDARY), BOUNDARY);
++CHECK_SIZE_ALIGN(struct Anon32, ROUND(2, BOUNDARY), BOUNDARY);
++CHECK_SIZE_ALIGN(struct PackedZero, 5, 1);
++
++struct ExplicitFit {
++  unsigned char a : 7;
++  unsigned short b : 9 __attribute__((aligned(1)));
++  char c;
++};
++#pragma pack(push, 2)
++struct ExplicitPragma {
++  unsigned a : 10;
++  unsigned long long b : 22 __attribute__((aligned(8)));
++  char c;
++};
++#pragma pack(pop)
++_Static_assert(__builtin_offsetof(struct ExplicitFit, c) == 4, "explicit alignment before container fit");
++_Static_assert(__builtin_offsetof(struct ExplicitPragma, c) == 5, "pragma caps explicit alignment");
++#else
++CHECK_SIZE_ALIGN(struct Zero16, ROUND(3, MAX(BOUNDARY, 2)), MAX(BOUNDARY, 2));
++CHECK_SIZE_ALIGN(struct Anon32, MAX(BOUNDARY, 4), MAX(BOUNDARY, 4));
++CHECK_SIZE_ALIGN(struct PackedZero, 8, 4);
++#endif
+-- 
+2.56.1
+

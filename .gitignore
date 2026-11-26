@@ -4,3 +4,8 @@ build/
 toolchain/
 *.o
 *.ll
+__pycache__/
+
+# Publish repository docs even when the user's global excludes contain *.md.
+!/README.md
+!/docs/*.md
